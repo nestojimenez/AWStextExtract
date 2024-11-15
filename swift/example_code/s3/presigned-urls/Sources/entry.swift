@@ -67,37 +67,72 @@ struct ExampleCommand: ParsableCommand {
             fileName = key!
         }
         
-        print("Uploading file from \(fileURL.absoluteString) to \(bucket)/\(fileName).")
-
-        // Create the presigned request for the `PostObject` request.
-        
-        // snippet-start:[swift.s3.presigned.presign-PutObject]
-        let fileData = try Data(contentsOf: fileURL)
-        let dataStream = ByteStream.data(fileData)
-
         let config = try await S3Client.S3ClientConfiguration(region: region)
         let s3Client = S3Client(config: config)
-        let putInput = PutObjectInput(
-            body: dataStream,
-            bucket: bucket,
-            key: fileName
-        )
         
-        // Presign the `PutObject` request with a 5-minute expiration. The
-        // presigned `URLRequest` can then be sent using the URL Loading System
-        // (https://developer.apple.com/documentation/foundation/url_loading_system/uploading_data_to_a_website).
+        // Look to see if the file already exists in the target bucket.
         
-        let presignedRequest: URLRequest
         do {
-            presignedRequest = try await s3Client.presignedRequestForPutObject(input: putInput, expiration: TimeInterval(5 * 60))
+            let headInput = HeadObjectInput(bucket: bucket, key: fileName)
+            let headResult = try await s3Client.headObject(input: headInput)
+            
+            // If HeadObject is successful, the file definitely exists.
+            
+            print("File exists with ETag \(headResult.eTag ?? "<no ETag>"). Skipping upload.")
+            return
+        } catch let error as AWSServiceError {
+            switch(error.errorCode) {
+            case "NotFound":
+                break
+            default:
+                throw TransferError.readError
+            }
+        }
+
+        print("Uploading file from \(fileURL.absoluteString) to \(bucket)/\(fileName).")
+
+        // Presign the `PutObject` request with a 10-minute expiration. The
+        // presigned request has a custom configuration that asks for up to
+        // six attempts to put the file.
+        //
+        // The presigned `URLRequest` can then be sent using the URL Loading System
+        // (https://developer.apple.com/documentation/foundation/url_loading_system/uploading_data_to_a_website).
+
+        // snippet-start:[swift.s3.presigned.presign-PutObject-advanced]
+        let fileData = try Data(contentsOf: fileURL)
+        let dataStream = ByteStream.data(fileData)
+        let presignedRequest: URLRequest
+
+        let putConfig = try await S3Client.S3ClientConfiguration(
+            maxAttempts: 6,
+            region: region
+        )
+
+        config.maxAttempts = 6
+        
+        do {
+            let request = try await PutObjectInput(
+                body: dataStream,
+                bucket: bucket,
+                key: fileName
+            ).presign(
+                config: config,
+                expiration: TimeInterval(10 * 60)
+            )
+            
+            guard let request else {
+                throw TransferError.signingError
+            }
+            try await presignedRequest = HTTPRequest.makeURLRequest(from: request)
         } catch {
             throw TransferError.signingError
         }
-        // snippet-end:[swift.s3.presigned.presign-PutObject]
+        // snippet-end:[swift.s3.presigned.presign-PutObject-advanced]
 
         // Send the HTTP request and upload the file to Amazon S3.
         
         try await httpSendFileRequest(request: presignedRequest, source: fileURL)
+        print("File uploaded to \(bucket)/\(fileName).")
     }
     // snippet-end:[swift.s3.presigned.presign-upload-file]
 
@@ -344,7 +379,8 @@ struct ExampleCommand: ParsableCommand {
     
     // snippet-start:[swift.s3.presigned.download-file]
     /// Download a file from the specified bucket and store it in the local
-    /// filesystem.
+    /// filesystem. Demonstrates using a custom configuration when presigning
+    /// a request.
     ///
     /// - Parameters:
     ///   - bucket: The Amazon S3 bucket name from which to retrieve the file.
@@ -421,8 +457,6 @@ struct ExampleCommand: ParsableCommand {
             throw TransferError.uploadError(
                 "Upload failed with status code: \(response.statusCode)"
             )
-        } else {
-            print("File uploaded to \(source.absoluteString)")
         }
     }
 
